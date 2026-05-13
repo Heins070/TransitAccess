@@ -1,0 +1,211 @@
+// DB diagram for use at https://dbdiagram.io/
+
+// ── Raw source tables ──────────────────────────────────────────────
+
+
+Table block_geom {
+  geoid text [pk]
+  shape geometry  // PostGIS polygon, GIST indexed
+
+  Note: "Census block polygon geometries. Indexed for spatial joins."
+}
+
+Table metro_buildings {
+  objectid integer [pk]
+  shape geometry  // building footprint polygon
+
+  Note: "Metro area building footprints. UTM 15N projection."
+}
+
+Table generalizedlanduse2020 {
+  objectid integer [pk]
+  shape geometry
+  landuse text  // land use description
+
+  Note: "Regional land use polygons. ST_Subdivide applied before joining."
+}
+
+Table hex_grid {
+  grid_id text [pk]
+  shape geometry  // hexagon polygon, GIST indexed
+
+  Note: "Pre-generated hex grid covering the metro area."
+}
+
+// ── Cleaned / transformed tables ──────────────────────────────────
+
+Table block_group_clean {
+  geoid text [pk]  // state||county||tract||block_group
+  pop_total integer
+  households_total integer
+  median_income numeric
+  income_total numeric
+  hh_no_car_total integer
+  pop_25_plus_total integer
+  bachelors_plus_total integer
+  workers_16_plus_total integer
+  drove_alone_total integer
+  carpooled_total integer
+  took_transit_total integer
+  worked_from_home_total integer
+
+  Note: "VIEW — cleans ACS data, casts floats to int, builds GEOID key."
+}
+
+Table block_clean {
+  geoid text [pk]  // state||county||tract||block
+  pop_total integer
+  pop_white_alone_total integer
+  jobs_total integer
+  jobs_over_40k_total integer
+  jobs_under_40k_total integer
+
+  Note: "VIEW — joins census blocks with LODES job counts via GEOID."
+}
+
+// ── Apportioned tables ─────────────────────────────────────────────
+
+Table blocks_apportioned {
+  geoid text [pk]
+  pop_total numeric
+  pop_white_alone_total numeric
+  jobs_total numeric
+  jobs_over_40k_total numeric
+  jobs_under_40k_total numeric
+  median_income numeric
+  // ACS variables apportioned by (block_pop / block_group_pop)
+  income_total numeric
+  households_total numeric
+  hh_no_car_total numeric
+  pop_25_plus_total numeric
+  bachelors_plus_total numeric
+  workers_16_plus_total numeric
+  drove_alone_total numeric
+  carpooled_total numeric
+  took_transit_total numeric
+  worked_from_home_total numeric
+
+  Note: "Stage 1 apportionment: ACS block-group estimates redistributed to block level using 2020 population weights. Fallback: equal share when block_group pop = 0."
+}
+
+Table landuse_category_dict {
+  landuse text [pk]
+  building_category text  // 'Residential', 'Job Site', 'Both', 'None'
+
+  Note: "Lookup table mapping land use descriptions to building categories. Drives residential vs. job-site area weight splits."
+}
+
+Table buildings_enriched {
+  objectid integer [pk]
+  shape geometry
+  building_area_sqm numeric
+  landuse text
+  census_block_geoid text
+
+  Note: "Spatial join output: each building footprint tagged with land use category and census block GEOID via ST_Intersects. ST_Subdivide used on land use layer for performance."
+}
+
+Table buildings_apportioned {
+  objectid integer [pk]
+  original_id text
+  shape geometry
+  census_block_geoid text 
+  landuse text
+  building_area_sqm numeric
+  res_weight numeric  // 4-tier fallback: adj_res → non-None → all → 1.0
+  job_weight numeric   // 4-tier fallback: adj_job → non-None → all → 1.0
+  // Residential variables (× res_weight)
+  pop_total numeric
+  pop_white_alone_total numeric
+  households_total numeric
+  hh_no_car_total numeric
+  income_total numeric
+  pop_25_plus_total numeric
+  bachelors_plus_total numeric
+  workers_16_plus_total numeric
+  drove_alone_total numeric
+  carpooled_total numeric
+  took_transit_total numeric
+  worked_from_home_total numeric
+  expected_median_income numeric  // not apportioned — ratio variable
+  // Job variables (× job_weight)
+  jobs_total numeric
+  jobs_over_40k_total numeric
+  jobs_under_40k_total numeric
+
+  Note: "Stage 2 apportionment: block-level estimates redistributed to building footprints by adjusted floor area. Mixed-use split 80/20 res/job. Block geometry used as fallback where no buildings exist."
+}
+
+// ── Final output ───────────────────────────────────────────────────
+
+Table hex_apportioned {
+  objectid integer [pk]
+  grid_id text
+  shape geometry
+  pop_total numeric
+  pop_white_alone_total numeric
+  non_white_pct numeric    // derived: 1 - (white / pop)
+  households_total numeric
+  hh_no_car_total numeric
+  hh_no_car_pct numeric
+  income_total numeric
+  per_capita_income numeric
+  pop_25_plus_total numeric
+  bachelors_plus_total numeric
+  bachelors_plus_pct numeric
+  workers_16_plus_total numeric
+  drove_alone_total numeric
+  drove_alone_pct numeric
+  carpooled_total numeric
+  carpooled_pct numeric
+  took_transit_total numeric
+  took_transit_pct numeric
+  worked_from_home_total numeric
+  worked_from_home_pct numeric
+  jobs_total numeric
+  jobs_over_40k_total numeric
+  jobs_over_40k_pct numeric
+  jobs_under_40k_total numeric
+  jobs_under_40k_pct numeric
+  jobs_per_household numeric
+
+  Note: "Final output: building-point data spatially aggregated to hex cells. Rate columns derived from count totals. Only hexes intersecting metro boundary included."
+}
+
+// ── RELATIONSHIPS ──────────────────────────────────────────────────
+
+// 1. ATTRIBUTE FLOW (Census Hierarchy)
+// One Block Group provides data for Many Apportioned Blocks
+Ref: block_group_clean.geoid < blocks_apportioned.geoid
+
+// One Clean Block matches One Apportioned Block
+Ref: block_clean.geoid - blocks_apportioned.geoid
+
+// 2. ENRICHMENT FLOW (Spatial Joins)
+// One Land Use Polygon type describes Many Enriched Buildings
+Ref: generalizedlanduse2020.landuse < buildings_enriched.landuse
+
+// The Dictionary categorizes Many Buildings
+Ref: landuse_category_dict.landuse < buildings_apportioned.landuse
+
+// One Census Block Geometry contains Many Buildings (Spatial Join)
+Ref: block_geom.geoid < buildings_enriched.census_block_geoid
+
+// 3. GEOMETRY & APPORTIONMENT FLOW
+// Building footprints provide the primary geometry for the enriched layer (1:1)
+Ref: metro_buildings.objectid - buildings_enriched.objectid
+Ref: metro_buildings.shape - buildings_enriched.shape
+
+// Enriched buildings are the direct source for the final weighted apportionment (1:1)
+Ref: buildings_enriched.objectid - buildings_apportioned.original_id
+Ref: buildings_enriched.shape - buildings_apportioned.shape
+Ref: block_geom.shape - buildings_apportioned.shape
+
+// Apportioned Blocks provide the numeric pool for Many Buildings
+Ref: blocks_apportioned.geoid < buildings_apportioned.census_block_geoid
+
+// 4. FINAL AGGREGATION
+// One Hex Grid cell acts as a container for Many Apportioned Buildings
+Ref: hex_grid.grid_id < hex_apportioned.grid_id
+Ref: hex_grid.shape - hex_apportioned.shape
+Ref: buildings_apportioned.shape > hex_apportioned.shape

@@ -1,0 +1,8 @@
+# Ignore the scratch folder and everything in it
+scratch/
+
+# Ignore environment files
+__pycache__/
+.ipynb_checkpoints/
+.env
+.vscode/
